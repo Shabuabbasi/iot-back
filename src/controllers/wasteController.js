@@ -2,17 +2,43 @@ import Waste from "../models/wasteModel.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { uploadToCloudinary } from "../config/cloudinary.js";
+import { sendBinFullAlert } from "../services/emailService.js";
+
+// Cooldown Map: prevents sending duplicate emails within 10 minutes per bin
+const emailCooldown = new Map(); // binId -> last alert timestamp
+const EMAIL_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Sends a bin-full email alert with cooldown protection.
+ * Will not re-send if an alert was already sent within EMAIL_COOLDOWN_MS.
+ */
+function triggerBinFullEmail(binId, location, wasteLevel) {
+  const lastSent = emailCooldown.get(binId);
+  const now = Date.now();
+  if (lastSent && now - lastSent < EMAIL_COOLDOWN_MS) {
+    const remaining = Math.ceil((EMAIL_COOLDOWN_MS - (now - lastSent)) / 60000);
+    console.log(`📧 Email cooldown active for bin ${binId} — skipping (${remaining} min left)`);
+    return;
+  }
+  emailCooldown.set(binId, now);
+  sendBinFullAlert({ binId, location, wasteLevel }); // fire-and-forget (non-blocking)
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Determine waste status based on distance and max distance
-const getWasteStatus = (distance, maxDistance = 30) => {
-  const percentage = (distance / maxDistance) * 100;
-  if (percentage < 33) return "empty";
-  if (percentage < 66) return "half";
+// Ultrasonic: small distance = more full (sensor at top measures clearance)
+function distanceToFillPercent(distance, maxDistance = 30) {
+  const fill = ((maxDistance - distance) / maxDistance) * 100;
+  return Math.max(0, Math.min(100, Math.round(fill)));
+}
+
+function fillPercentToStatus(fillPercent) {
+  if (fillPercent < 33) return "empty";
+  if (fillPercent < 66) return "half";
   return "full";
-};
+}
 
 // Upload waste level and image (handles binary data from ESP32)
 export const uploadWasteData = async (req, res) => {
@@ -23,14 +49,13 @@ export const uploadWasteData = async (req, res) => {
     
     // Get data from headers (sent by ESP32)
     const wasteDistance = parseFloat(req.headers["x-waste-distance"]);
-    const wasteLevel = parseFloat(req.headers["x-waste-level"]) || null;
     const binId = req.headers["x-bin-id"] || (req.body && req.body.binId);
     const location = req.headers["x-location"] || (req.body && req.body.location);
     const maxDistance = parseFloat(req.headers["x-max-distance"]) || 30;
     const lat = parseFloat(req.headers["x-lat"]) || (req.body && req.body.lat);
     const lng = parseFloat(req.headers["x-lng"]) || (req.body && req.body.lng);
 
-    console.log("✓ Parsed data:", { binId, location, wasteDistance, wasteLevel, lat, lng });
+    console.log("✓ Parsed data:", { binId, location, wasteDistance, lat, lng });
 
     // Validation
     if (!binId || !location || isNaN(wasteDistance)) {
@@ -46,10 +71,9 @@ export const uploadWasteData = async (req, res) => {
       fs.mkdirSync(uploadsDir, { recursive: true });
     }
 
-    // Calculate waste level as percentage
-    const calculatedWasteLevel = Math.min((wasteDistance / maxDistance) * 100, 100);
-    const finalWasteLevel = wasteLevel !== null ? Math.round(wasteLevel) : Math.round(calculatedWasteLevel);
-    const status = getWasteStatus(wasteDistance, maxDistance);
+    // Calculate fill % from clearance: less distance = more full
+    const finalWasteLevel = distanceToFillPercent(wasteDistance, maxDistance);
+    const status = fillPercentToStatus(finalWasteLevel);
 
     // Prepare update object
     const updateData = {
@@ -62,29 +86,51 @@ export const uploadWasteData = async (req, res) => {
     };
 
     // Handle image upload
-    if (req.file) {
-      // Image uploaded via multipart form (from web)
-      updateData.imagePath = req.file.path;
-      updateData.imageUrl = `/uploads/waste/${req.file.filename}`;
-      console.log("✓ Image from multer:", updateData.imageUrl);
-    } else if (Buffer.isBuffer(req.body) && req.body.length > 0) {
-      // Handle raw binary data sent from ESP32
-      const timestamp = Date.now();
-      const filename = `${binId}-${timestamp}.jpg`;
-      const filepath = path.join(uploadsDir, filename);
-
-      console.log(`📸 Saving image: ${filename} (${req.body.length} bytes)`);
-
+    if (process.env.NODE_ENV === "production") {
       try {
-        fs.writeFileSync(filepath, req.body);
-        updateData.imagePath = filepath;
-        updateData.imageUrl = `/uploads/waste/${filename}`;
-        console.log("✅ Image saved successfully");
+        let buffer;
+        if (req.file) {
+          buffer = fs.readFileSync(req.file.path);
+        } else if (Buffer.isBuffer(req.body) && req.body.length > 0) {
+          buffer = req.body;
+        }
+
+        if (buffer) {
+          console.log(`📸 Uploading image to Cloudinary (${buffer.length} bytes)`);
+          const result = await uploadToCloudinary(buffer);
+          updateData.imageUrl = result.secure_url;
+          console.log("✅ Image uploaded to Cloudinary:", result.secure_url);
+        } else {
+          console.warn("⚠️ No image data received for bin:", binId);
+        }
       } catch (err) {
-        console.error("❌ Error saving image:", err);
+        console.error("❌ Error uploading image to Cloudinary:", err);
       }
     } else {
-      console.warn("⚠️ No image data received for bin:", binId);
+      if (req.file) {
+        // Image uploaded via multipart form (from web)
+        updateData.imagePath = req.file.path;
+        updateData.imageUrl = `/uploads/waste/${req.file.filename}`;
+        console.log("✓ Image from multer:", updateData.imageUrl);
+      } else if (Buffer.isBuffer(req.body) && req.body.length > 0) {
+        // Handle raw binary data sent from ESP32
+        const timestamp = Date.now();
+        const filename = `${binId}-${timestamp}.jpg`;
+        const filepath = path.join(uploadsDir, filename);
+
+        console.log(`📸 Saving image: ${filename} (${req.body.length} bytes)`);
+
+        try {
+          fs.writeFileSync(filepath, req.body);
+          updateData.imagePath = filepath;
+          updateData.imageUrl = `/uploads/waste/${filename}`;
+          console.log("✅ Image saved successfully");
+        } catch (err) {
+          console.error("❌ Error saving image:", err);
+        }
+      } else {
+        console.warn("⚠️ No image data received for bin:", binId);
+      }
     }
 
     // Add IP address
@@ -107,6 +153,8 @@ export const uploadWasteData = async (req, res) => {
           location: waste.location,
           wasteLevel: waste.wasteLevel
         });
+        // 📧 Send email alert to admin
+        triggerBinFullEmail(waste.binId, waste.location, waste.wasteLevel);
       }
     }
 
@@ -130,6 +178,40 @@ export const uploadWasteData = async (req, res) => {
       message: "Error uploading waste data",
       error: error.message
     });
+  }
+};
+
+// Register a new bin from admin UI (before ESP32 connects)
+export const registerBin = async (req, res) => {
+  try {
+    const { binId, location, lat, lng } = req.body;
+
+    if (!binId || !location) {
+      return res.status(400).json({ message: "binId and location are required" });
+    }
+
+    const existing = await Waste.findOne({ binId });
+    if (existing) {
+      return res.status(409).json({ message: `Bin ${binId} already exists` });
+    }
+
+    const waste = await Waste.create({
+      binId: binId.trim(),
+      location: location.trim(),
+      distance: 30,
+      wasteLevel: 0,
+      status: "empty",
+      lat: lat != null && !isNaN(parseFloat(lat)) ? parseFloat(lat) : undefined,
+      lng: lng != null && !isNaN(parseFloat(lng)) ? parseFloat(lng) : undefined
+    });
+
+    const io = req.app.get("io");
+    if (io) io.emit("binUpdate", waste);
+
+    res.status(201).json({ message: "Bin registered successfully", data: waste });
+  } catch (error) {
+    console.error("Error registering bin:", error);
+    res.status(500).json({ message: "Error registering bin", error: error.message });
   }
 };
 
@@ -248,11 +330,7 @@ export const uploadUltrasonicData = async (req, res) => {
     const maxDistance = 30;
     const distance = maxDistance - (wasteLevel / 100) * maxDistance;
     
-    // Determine status based on level
-    let status;
-    if (wasteLevel < 33) status = "empty";
-    else if (wasteLevel < 66) status = "half";
-    else status = "full";
+    const status = fillPercentToStatus(Math.round(wasteLevel));
 
     // Default location for test
     const location = "Test_Location";
@@ -300,16 +378,17 @@ export const uploadUltrasonicData = async (req, res) => {
   }
 };
 
-// Heartbeat endpoint to monitor if ESP32 is online
+// Heartbeat endpoint — live level updates without image upload
 export const logHeartbeat = async (req, res) => {
   try {
-    const { binId, distance } = req.body;
+    const { binId, distance, location, maxDistance: maxDistBody } = req.body;
     
     if (!binId) {
       return res.status(400).json({ message: "binId is required" });
     }
 
     const timestamp = new Date().toLocaleTimeString();
+    const maxDistance = parseFloat(maxDistBody) || 30;
     
     console.log(`\n======================================================`);
     console.log(`🟢 [${timestamp}] ESP32 ONLINE!`);
@@ -319,7 +398,54 @@ export const logHeartbeat = async (req, res) => {
     }
     console.log(`======================================================\n`);
 
-    res.status(200).json({ message: "Heartbeat received" });
+    let waste = null;
+    if (distance !== undefined && !isNaN(parseFloat(distance))) {
+      const wasteDistance = parseFloat(distance);
+      const wasteLevel = distanceToFillPercent(wasteDistance, maxDistance);
+      const status = fillPercentToStatus(wasteLevel);
+
+      const update = {
+        $set: { distance: wasteDistance, wasteLevel, status },
+        $setOnInsert: { binId }
+      };
+      if (location?.trim()) {
+        update.$set.location = location.trim();
+      } else {
+        update.$setOnInsert.location = "Unknown";
+      }
+
+      waste = await Waste.findOneAndUpdate({ binId }, update, {
+        new: true,
+        upsert: true,
+        setDefaultsOnInsert: true
+      });
+
+      const io = req.app.get("io");
+      if (io) {
+        io.emit("binUpdate", waste);
+        if (waste.status === "full") {
+          io.emit("binFull", {
+            binId: waste.binId,
+            location: waste.location,
+            wasteLevel: waste.wasteLevel
+          });
+          // 📧 Send email alert to admin
+          triggerBinFullEmail(waste.binId, waste.location, waste.wasteLevel);
+        }
+      }
+    }
+
+    res.status(200).json({
+      message: "Heartbeat received",
+      ...(waste && {
+        data: {
+          binId: waste.binId,
+          distance: waste.distance,
+          wasteLevel: waste.wasteLevel,
+          status: waste.status
+        }
+      })
+    });
   } catch (error) {
     console.error("Heartbeat error:", error);
     res.status(500).json({ message: "Heartbeat error" });

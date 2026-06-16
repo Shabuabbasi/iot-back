@@ -1,33 +1,47 @@
 #include "esp_camera.h"
+#include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <Arduino.h>
 
-// ==================== WiFi Configuration ====================
-const char* ssid = "eduroam";                    // Your WiFi SSID
-const char* password = "4388";               // Your WiFi Password
+// ==================== WiFi ====================
+const char* ssid = "infinix10";
+const char* password = "abbasi1234567";
 
-// ==================== Backend API Configuration ====================
-const char* serverUrl = "http://10.140.121.162:5000/api/waste/upload";  // Your server IP
-const char* binId = "BIN_001";                   // Unique identifier for this bin
-const char* location = "BSSE_Building_Floor_4";  // Location of the bin
-const char* notificationUrl = "http://10.140.121.162:5000/api/waste/notification";  // Notification endpoint
+// ==================== Backend ====================
+const char* uploadUrl = "http://10.168.118.219:5000/api/waste/upload";
+const char* heartbeatUrl = "http://10.168.118.219:5000/api/waste/heartbeat";
+const char* binId = "BIN_001";
+const char* locationName = "BSSE_Building_Floor_4";
 
-// ==================== Ultrasonic Sensor Pins (According to Specification) ====================
-#define TRIG_PIN 12  // GPIO12 sends trigger pulse
-#define ECHO_PIN 13  // GPIO13 receives echo pulse
+// ==================== Ultrasonic Sensor ====================
+// Use the same pin where your Echo wire is connected.
+// If your Echo wire is on GPIO13, change ECHO_PIN from 15 to 13.
+#define TRIG_PIN 12
+#define ECHO_PIN 15
 
-// ==================== Waste Level Threshold ====================
-#define WASTE_THRESHOLD_PERCENT 80  // Send notification when waste level >= 80%
-#define MAX_BIN_HEIGHT 30           // Maximum height in cm
+// Your real closed-bin empty distance is 29 cm.
+const float BIN_HEIGHT_CM = 29.0;
 
-// ==================== Camera Pin Configuration ====================
+// When the foot pedal opens the lid, your sensor reads about 50 cm.
+// That is outside the bin, so the code ignores it and keeps the last good reading.
+const float LID_OPEN_DISTANCE_CM = 38.0;
+const float MAX_SENSOR_DISTANCE_CM = 80.0;
+
+// ==================== Timing ====================
+const unsigned long HEARTBEAT_INTERVAL_MS = 2000;
+const unsigned long IMAGE_UPLOAD_INTERVAL_MS = 30000;
+
+unsigned long lastHeartbeatMs = 0;
+unsigned long lastUploadMs = 0;
+float lastGoodDistance = BIN_HEIGHT_CM;
+bool cameraReady = false;
+
+// ==================== AI Thinker ESP32-CAM Pins ====================
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
 #define SIOD_GPIO_NUM     26
 #define SIOC_GPIO_NUM     27
-
 #define Y9_GPIO_NUM       35
 #define Y8_GPIO_NUM       34
 #define Y7_GPIO_NUM       39
@@ -40,14 +54,29 @@ const char* notificationUrl = "http://10.140.121.162:5000/api/waste/notification
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// ==================== Variables ====================
-long duration;
-float distance;
-float wasteLevel = 0;
-bool wasteAlertSent = false;  // Track if alert was already sent for current full state
-int sendInterval = 30000;     // Send data every 30 seconds (change as needed)
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
 
-// ==================== Function to Initialize Camera ====================
+  Serial.print("Connecting to WiFi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  unsigned long startMs = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startMs < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("WiFi connection failed. Will retry.");
+  }
+}
+
 void initializeCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -60,297 +89,188 @@ void initializeCamera() {
   config.pin_d5 = Y7_GPIO_NUM;
   config.pin_d6 = Y8_GPIO_NUM;
   config.pin_d7 = Y9_GPIO_NUM;
-
   config.pin_xclk = XCLK_GPIO_NUM;
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
-
   config.pin_sccb_sda = SIOD_GPIO_NUM;
   config.pin_sccb_scl = SIOC_GPIO_NUM;
-
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  config.frame_size = FRAMESIZE_VGA;
-  config.jpeg_quality = 10;
-  config.fb_count = 1;
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    cameraReady = false;
     return;
   }
 
-  Serial.println("Camera initialized successfully");
+  cameraReady = true;
+  Serial.println("Camera initialized");
 }
 
-// ==================== Function to Read Distance from Ultrasonic Sensor ====================
-float readDistance() {
-  // Send trigger pulse
+float rawDistanceCm() {
   digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-
+  delayMicroseconds(5);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  // Measure pulse duration
-  duration = pulseIn(ECHO_PIN, HIGH);
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return -1.0;
 
-  // Calculate distance (cm) = duration (microseconds) * 0.034 / 2
-  distance = duration * 0.034 / 2;
+  return (duration * 0.0343) / 2.0;
+}
 
-  Serial.print("Distance: ");
-  Serial.print(distance);
-  Serial.println(" cm");
+float readDistanceCm(bool* lidOpen) {
+  const int samples = 5;
+  float total = 0;
+  int count = 0;
+  int lidOpenCount = 0;
 
+  for (int i = 0; i < samples; i++) {
+    float d = rawDistanceCm();
+    delay(60);
+
+    if (d < 0 || d > MAX_SENSOR_DISTANCE_CM) {
+      continue;
+    }
+
+    if (d > LID_OPEN_DISTANCE_CM) {
+      lidOpenCount++;
+      continue;
+    }
+
+    total += d;
+    count++;
+  }
+
+  *lidOpen = lidOpenCount > 0 && count == 0;
+
+  if (count == 0) {
+    return lastGoodDistance;
+  }
+
+  float distance = total / count;
+  if (distance < 0) distance = 0;
+  if (distance > BIN_HEIGHT_CM) distance = BIN_HEIGHT_CM;
+
+  lastGoodDistance = distance;
   return distance;
 }
 
-// ==================== Function to Capture Image ====================
-camera_fb_t* capturePhoto() {
-  camera_fb_t* fb = esp_camera_fb_get();
+int fillPercentFromDistance(float distance) {
+  int fill = round(((BIN_HEIGHT_CM - distance) / BIN_HEIGHT_CM) * 100.0);
+  if (fill < 0) fill = 0;
+  if (fill > 100) fill = 100;
+  return fill;
+}
 
+void sendHeartbeat(float distance, bool lidOpen) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(heartbeatUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{";
+  payload += "\"binId\":\"" + String(binId) + "\",";
+  payload += "\"location\":\"" + String(locationName) + "\",";
+  payload += "\"distance\":" + String(distance, 1) + ",";
+  payload += "\"maxDistance\":" + String(BIN_HEIGHT_CM, 1) + ",";
+  payload += "\"lidOpen\":" + String(lidOpen ? "true" : "false");
+  payload += "}";
+
+  int code = http.POST(payload);
+  Serial.print("Heartbeat HTTP: ");
+  Serial.println(code);
+  http.end();
+}
+
+void uploadPhoto(float distance) {
+  if (!cameraReady || WiFi.status() != WL_CONNECTED) return;
+
+  camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed");
-    return NULL;
-  }
-
-  Serial.printf("Photo captured. Size: %d bytes\n", fb->len);
-  return fb;
-}
-
-// ==================== Function to Send Waste Alert/Notification ====================
-void sendWasteNotification(float level) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected - cannot send notification");
     return;
   }
 
   HTTPClient http;
-
-  Serial.println("\n⚠️ WASTE LEVEL ALERT! Sending notification...");
-  http.begin(notificationUrl);
-
-  http.addHeader("Content-Type", "application/json");
+  http.begin(uploadUrl);
+  http.addHeader("Content-Type", "image/jpeg");
   http.addHeader("X-Bin-ID", binId);
-  http.addHeader("X-Location", location);
+  http.addHeader("X-Location", locationName);
+  http.addHeader("X-Waste-Distance", String(distance, 1));
+  http.addHeader("X-Max-Distance", String(BIN_HEIGHT_CM, 1));
 
-  // Create JSON payload for notification
-  String jsonPayload = "{\"binId\":\"" + String(binId) + 
-                       "\",\"location\":\"" + String(location) + 
-                       "\",\"wasteLevel\":" + String(level) + 
-                       ",\"message\":\"Waste level is HIGH! Bin needs immediate collection.\"}";
+  int code = http.POST(fb->buf, fb->len);
+  Serial.print("Upload HTTP: ");
+  Serial.println(code);
 
-  int responseCode = http.POST(jsonPayload);
-
-  Serial.print("Notification Response Code: ");
-  Serial.println(responseCode);
-
-  if (responseCode == HTTP_CODE_OK) {
-    Serial.println("✅ Notification sent successfully!");
-    wasteAlertSent = true;  // Mark that alert was sent
+  if (code > 0) {
+    Serial.println(http.getString());
   } else {
-    Serial.println("❌ Failed to send notification");
-  }
-
-  http.end();
-}
-
-// ==================== Function to Send Waste Data ====================
-void sendDataToBackend() {
-  // Read distance
-  float wasteDistance = readDistance();
-
-  // Calculate waste level percentage
-  wasteLevel = (wasteDistance / MAX_BIN_HEIGHT) * 100;
-  if (wasteLevel > 100) wasteLevel = 100;  // Cap at 100%
-  
-  Serial.print("Waste Level: ");
-  Serial.print(wasteLevel);
-  Serial.println("%");
-
-  // ✅ CHECK IF WASTE LEVEL EXCEEDS THRESHOLD (80%)
-  if (wasteLevel >= WASTE_THRESHOLD_PERCENT) {
-    if (!wasteAlertSent) {
-      Serial.println("\n🚨 WASTE LEVEL CRITICAL - >= 80%!");
-      sendWasteNotification(wasteLevel);
-    }
-  } else {
-    // Reset alert flag when waste goes below threshold
-    if (wasteAlertSent && wasteLevel < WASTE_THRESHOLD_PERCENT) {
-      Serial.println("✅ Waste level back to normal");
-      wasteAlertSent = false;
-    }
-  }
-
-  // Capture image
-  camera_fb_t* fb = capturePhoto();
-
-  if (!fb) {
-    Serial.println("Failed to capture image");
-    return;
-  }
-
-  // Check WiFi connection
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected");
-    esp_camera_fb_return(fb);
-    return;
-  }
-
-  // Create HTTP request
-  HTTPClient http;
-
-  Serial.println("Starting HTTP request...");
-  http.begin(serverUrl);
-
-  // Add headers
-  http.addHeader("Content-Type", "application/octet-stream");
-  http.addHeader("X-Waste-Distance", String(wasteDistance));
-  http.addHeader("X-Waste-Level", String(wasteLevel));
-  http.addHeader("X-Bin-ID", binId);
-  http.addHeader("X-Location", location);
-
-  Serial.println("Sending request with image data...");
-
-  // Send POST request with image data
-  int responseCode = http.POST(fb->buf, fb->len);
-
-  Serial.print("HTTP Response Code: ");
-  Serial.println(responseCode);
-
-  // Handle response
-  if (responseCode == HTTP_CODE_OK) {
-    String response = http.getString();
-    Serial.println("Response: ");
-    Serial.println(response);
-  } else {
-    Serial.print("Error: ");
-    Serial.println(http.errorToString(responseCode));
+    Serial.println(http.errorToString(code));
   }
 
   http.end();
   esp_camera_fb_return(fb);
 }
 
-// ==================== Function to Send Data (Alternative: Using Multipart Form) ====================
-void sendDataToBackendMultipart() {
-  // Read distance
-  float wasteDistance = readDistance();
-
-  // Capture image
-  camera_fb_t* fb = capturePhoto();
-
-  if (!fb) {
-    Serial.println("Failed to capture image");
-    return;
-  }
-
-  // Check WiFi connection
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected");
-    esp_camera_fb_return(fb);
-    return;
-  }
-
-  // Create HTTP request
-  HTTPClient http;
-
-  Serial.println("Starting multipart HTTP request...");
-  http.begin(serverUrl);
-
-  // Set headers for multipart form
-  String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
-  String contentType = "multipart/form-data; boundary=" + boundary;
-  http.addHeader("Content-Type", contentType);
-
-  // Create multipart body
-  String body = "--" + boundary + "\r\n";
-  body += "Content-Disposition: form-data; name=\"binId\"\r\n\r\n";
-  body += binId;
-  body += "\r\n--" + boundary + "\r\n";
-  body += "Content-Disposition: form-data; name=\"location\"\r\n\r\n";
-  body += location;
-  body += "\r\n--" + boundary + "\r\n";
-  body += "Content-Disposition: form-data; name=\"distance\"\r\n\r\n";
-  body += String(wasteDistance);
-  body += "\r\n--" + boundary + "\r\n";
-  body += "Content-Disposition: form-data; name=\"image\"; filename=\"bin_photo.jpg\"\r\n";
-  body += "Content-Type: image/jpeg\r\n\r\n";
-
-  // Note: This method requires buffering which may cause memory issues on ESP32
-  // Use sendDataToBackend() method above as preferred
-
-  http.end();
-  esp_camera_fb_return(fb);
-}
-
-// ==================== Setup Function ====================
 void setup() {
   Serial.begin(115200);
-  delay(2000);
+  delay(1000);
 
-  Serial.println("\n\n");
-  Serial.println("==============================================");
-  Serial.println("ESP32-CAM Waste Management System");
-  Serial.println("==============================================\n");
-
-  // Initialize pins
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  // Initialize camera
-  Serial.println("Initializing camera...");
+  Serial.println();
+  Serial.println("ESP32-CAM Smart Bin Starting");
+  Serial.println("Bin height: 29 cm");
+  Serial.println("Lid-open readings above 38 cm will be ignored");
+
   initializeCamera();
-
-  // Connect to WiFi
-  Serial.println("\nConnecting to WiFi...");
-  Serial.print("SSID: ");
-  Serial.println(ssid);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("RSSI: ");
-    Serial.println(WiFi.RSSI());
-  } else {
-    Serial.println("\nFailed to connect to WiFi");
-  }
-
-  Serial.println("\n==============================================");
-  Serial.println("System Ready - Starting data collection");
-  Serial.println("==============================================\n");
+  connectWiFi();
 }
 
-// ==================== Main Loop ====================
 void loop() {
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n--- Sending Waste Data ---");
-    sendDataToBackend();
-  } else {
-    Serial.println("WiFi disconnected. Attempting to reconnect...");
-    WiFi.reconnect();
+  connectWiFi();
+
+  bool lidOpen = false;
+  float distance = readDistanceCm(&lidOpen);
+  int fillPercent = fillPercentFromDistance(distance);
+
+  Serial.print("Distance used: ");
+  Serial.print(distance, 1);
+  Serial.print(" cm | Fill: ");
+  Serial.print(fillPercent);
+  Serial.print("% | Lid: ");
+  Serial.println(lidOpen ? "OPEN" : "CLOSED");
+
+  unsigned long now = millis();
+
+  if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+    sendHeartbeat(distance, lidOpen);
+    lastHeartbeatMs = now;
   }
 
-  Serial.print("Next transmission in ");
-  Serial.print(sendInterval / 1000);
-  Serial.println(" seconds...\n");
+  if (!lidOpen && now - lastUploadMs >= IMAGE_UPLOAD_INTERVAL_MS) {
+    uploadPhoto(distance);
+    lastUploadMs = now;
+  }
 
-  delay(sendInterval);
+  delay(500);
 }

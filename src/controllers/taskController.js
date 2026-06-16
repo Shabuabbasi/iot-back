@@ -1,6 +1,8 @@
 import Task from "../models/taskModel.js";
 import Waste from "../models/wasteModel.js";
 import User from "../models/userModel.js";
+import { uploadToCloudinary } from "../config/cloudinary.js";
+import fs from "fs";
 
 // @desc    Assign a task to a collector
 // @route   POST /api/tasks/assign
@@ -128,8 +130,19 @@ export const completeTask = async (req, res) => {
     let imagePath = null;
 
     if (req.file) {
-      imageUrl = `${req.protocol}://${req.get("host")}/uploads/waste/${req.file.filename}`;
-      imagePath = req.file.path;
+      if (process.env.NODE_ENV === "production") {
+        try {
+          const buffer = fs.readFileSync(req.file.path);
+          const result = await uploadToCloudinary(buffer);
+          imageUrl = result.secure_url;
+        } catch (err) {
+          console.error("Cloudinary Upload Error:", err);
+          return res.status(500).json({ message: "Failed to upload image to Cloudinary" });
+        }
+      } else {
+        imageUrl = `${req.protocol}://${req.get("host")}/uploads/waste/${req.file.filename}`;
+        imagePath = req.file.path;
+      }
     } else {
        return res.status(400).json({ message: "Please upload an image to complete the task" });
     }

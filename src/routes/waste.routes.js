@@ -6,7 +6,8 @@ import {
   getWasteStats,
   getFullBins,
   uploadUltrasonicData,
-  logHeartbeat
+  logHeartbeat,
+  registerBin
 } from "../controllers/wasteController.js";
 import upload from "../middlewares/uploadMiddleware.js";
 
@@ -32,6 +33,9 @@ router.post("/", uploadUltrasonicData);
 
 // Heartbeat endpoint
 router.post("/heartbeat", logHeartbeat);
+
+// Register bin from admin UI
+router.post("/register", registerBin);
 
 // Get all waste data
 router.get("/all", getAllWaste);
