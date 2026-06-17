@@ -9,6 +9,11 @@ const transporter = nodemailer.createTransport({
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
+  // Force IPv4 because Railway sometimes blocks outgoing IPv6 SMTP connections
+  tls: {
+    rejectUnauthorized: false
+  },
+  family: 4 // Force IPv4
 });
 
 /**
