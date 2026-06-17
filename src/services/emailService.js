@@ -1,29 +1,3 @@
-import nodemailer from "nodemailer";
-import dns from "dns";
-
-// Force Node.js to prefer IPv4 for all DNS lookups to avoid Railway IPv6 ENETUNREACH
-dns.setDefaultResultOrder("ipv4first");
-
-// Create reusable transporter using SMTP credentials from .env
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || "smtp.gmail.com",
-  port: parseInt(process.env.SMTP_PORT) || 587,
-  secure: false, // true for port 465, false for 587
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-  // Force IPv4 because Railway sometimes blocks outgoing IPv6 SMTP connections
-  tls: {
-    rejectUnauthorized: false
-  },
-  family: 4 // Force IPv4
-});
-
-/**
- * Send an email alert to the admin when a bin is detected as FULL.
- * @param {Object} binData - { binId, location, wasteLevel }
- */
 export const sendBinFullAlert = async ({ binId, location, wasteLevel }) => {
   const adminEmail = process.env.NOTIFICATION_EMAIL;
 
@@ -93,17 +67,31 @@ export const sendBinFullAlert = async ({ binId, location, wasteLevel }) => {
     </div>
   `;
 
-  const mailOptions = {
-    from: `"Smart Waste System 🗑️" <${process.env.SMTP_USER}>`,
-    to: adminEmail,
-    subject,
-    html,
-  };
-
   try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log(`✅ Email alert sent for bin ${binId} → ${adminEmail} (ID: ${info.messageId})`);
+    const RESEND_API_KEY = "re_D7VzAmGk_3DcNcbBRY8tucbdsYqLuWQXz";
+
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+      },
+      body: JSON.stringify({
+        from: "Smart Waste System <onboarding@resend.dev>",
+        to: [adminEmail],
+        subject: subject,
+        html: html,
+      }),
+    });
+
+    const data = await response.json();
+
+    if (response.ok) {
+      console.log(`✅ Resend API alert sent for bin ${binId} → ${adminEmail} (ID: ${data.id})`);
+    } else {
+      console.error(`❌ Failed to send Resend API alert:`, data);
+    }
   } catch (err) {
-    console.error(`❌ Failed to send email alert for bin ${binId}:`, err.message);
+    console.error(`❌ Error in emailService:`, err.message);
   }
 };
