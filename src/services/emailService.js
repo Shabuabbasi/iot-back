@@ -1,4 +1,8 @@
 import nodemailer from "nodemailer";
+import dns from "dns";
+
+// Force Node.js to prefer IPv4 for all DNS lookups to avoid Railway IPv6 ENETUNREACH
+dns.setDefaultResultOrder("ipv4first");
 
 // Create reusable transporter using SMTP credentials from .env
 const transporter = nodemailer.createTransport({
