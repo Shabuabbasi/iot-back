@@ -2,6 +2,20 @@ import User from "../models/userModel.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
+const buildAuthUser = (user) => ({
+    id: user._id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    phone: user.phone || "",
+    dob: user.dob || "",
+    education: user.education || "",
+    department: user.department || "",
+    position: user.position || "",
+    experience: user.experience || "",
+    address: user.address || "",
+    profilePic: user.profilePic || ""
+});
 
 // REGISTER
 export const register = async (req, res) => {
@@ -31,12 +45,7 @@ export const register = async (req, res) => {
 
         res.status(201).json({
             message: "User registered successfully",
-            user: {
-                id: user._id,
-                name: user.name,
-                email: user.email,
-                role: user.role
-            }
+            user: buildAuthUser(user)
         });
 
     } catch (error) {
@@ -81,12 +90,7 @@ export const login = async (req, res) => {
         res.status(200).json({
             message: "Login successful",
             token,
-            user: {
-                id: user._id,
-                name: user.name,
-                email: user.email,
-                role: user.role
-            }
+            user: buildAuthUser(user)
         });
 
     } catch (error) {
