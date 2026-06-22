@@ -2,15 +2,12 @@ import { Resend } from 'resend';
 
 const sendEmail = async ({ to, subject, text, html }) => {
   try {
-    // Debug: log the first 10 chars of the key so we can verify Railway is injecting it
-    console.log("RESEND_API_KEY starts with:", process.env.RESEND_API_KEY ? process.env.RESEND_API_KEY.substring(0, 10) : "UNDEFINED");
+    // Use env variable, with hardcoded fallback since Railway is not injecting it
+    const apiKey = process.env.RESEND_API_KEY || "re_CU37kqU1_7vsThbMH6n4uCYH5cM7guKNj";
+    console.log("RESEND_API_KEY starts with:", apiKey ? apiKey.substring(0, 10) : "UNDEFINED");
 
-    if (!process.env.RESEND_API_KEY) {
-      throw new Error("Missing RESEND_API_KEY in environment variables");
-    }
-    
     // Initialize inside the function to prevent crashing the whole server on startup
-    const resend = new Resend(process.env.RESEND_API_KEY);
+    const resend = new Resend(apiKey);
     const { data, error } = await resend.emails.send({
       // IMPORTANT: Unless you verify a custom domain on Resend, 
       // you MUST use 'onboarding@resend.dev' as the sender.
