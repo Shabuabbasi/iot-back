@@ -1,10 +1,13 @@
 import { Resend } from 'resend';
 
-// Initialize Resend with API Key from environment variables
-const resend = new Resend(process.env.RESEND_API_KEY);
-
 const sendEmail = async ({ to, subject, text, html }) => {
   try {
+    if (!process.env.RESEND_API_KEY) {
+      throw new Error("Missing RESEND_API_KEY in environment variables");
+    }
+    
+    // Initialize inside the function to prevent crashing the whole server on startup
+    const resend = new Resend(process.env.RESEND_API_KEY);
     const { data, error } = await resend.emails.send({
       // IMPORTANT: Unless you verify a custom domain on Resend, 
       // you MUST use 'onboarding@resend.dev' as the sender.
