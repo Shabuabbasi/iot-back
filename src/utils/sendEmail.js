@@ -1,4 +1,9 @@
 import nodemailer from "nodemailer";
+import dns from "dns";
+
+// Force IPv4 because Railway sometimes struggles with IPv6 outbound connections to Gmail
+dns.setDefaultResultOrder('ipv4first');
+
 
 const sendEmail = async ({ to, subject, text, html }) => {
   try {
