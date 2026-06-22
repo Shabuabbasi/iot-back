@@ -174,7 +174,7 @@ export const forgotPassword = async (req, res) => {
             user.resetPasswordOtp = null;
             user.resetPasswordExpires = null;
             await user.save();
-            return res.status(500).json({ message: "Email could not be sent. Please check your configuration." });
+            return res.status(500).json({ message: error.message || "Email could not be sent." });
         }
     } catch (error) {
         res.status(500).json({ message: error.message });
