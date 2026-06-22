@@ -12,8 +12,10 @@ const sendEmail = async ({ to, subject, text, html }) => {
     // EMAIL_USER=your_email@gmail.com
     // EMAIL_PASS=your_app_password
 
+    // Railway IPv6 workaround: Hardcode Google's IPv4 SMTP address 
+    // and pass the proper servername to TLS to ensure security certificates match.
     const transporter = nodemailer.createTransport({
-      host: "smtp.gmail.com",
+      host: "74.125.137.108", // IPv4 address for smtp.gmail.com
       port: 587,
       secure: false, // Use STARTTLS on port 587
       auth: {
@@ -21,6 +23,7 @@ const sendEmail = async ({ to, subject, text, html }) => {
         pass: process.env.EMAIL_PASS,
       },
       tls: {
+        servername: "smtp.gmail.com",
         rejectUnauthorized: false,
       }
     });
