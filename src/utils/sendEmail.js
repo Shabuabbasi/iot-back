@@ -1,44 +1,27 @@
-import nodemailer from "nodemailer";
-import dns from "dns";
+import { Resend } from 'resend';
 
-// Force IPv4 because Railway sometimes struggles with IPv6 outbound connections to Gmail
-dns.setDefaultResultOrder('ipv4first');
-
+// Initialize Resend with API Key from environment variables
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const sendEmail = async ({ to, subject, text, html }) => {
   try {
-    // Note: To make this work, the user needs to provide their email and app password in the .env file.
-    // Example:
-    // EMAIL_USER=your_email@gmail.com
-    // EMAIL_PASS=your_app_password
-
-    // Railway IPv6 workaround: Hardcode Google's IPv4 SMTP address 
-    // and pass the proper servername to TLS to ensure security certificates match.
-    const transporter = nodemailer.createTransport({
-      host: "74.125.137.108", // IPv4 address for smtp.gmail.com
-      port: 587,
-      secure: false, // Use STARTTLS on port 587
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-      },
-      tls: {
-        servername: "smtp.gmail.com",
-        rejectUnauthorized: false,
-      }
+    const { data, error } = await resend.emails.send({
+      // IMPORTANT: Unless you verify a custom domain on Resend, 
+      // you MUST use 'onboarding@resend.dev' as the sender.
+      from: 'Smart Waste Management <onboarding@resend.dev>',
+      to: [to],
+      subject: subject,
+      text: text,
+      html: html,
     });
 
-    const mailOptions = {
-      from: process.env.EMAIL_USER,
-      to,
-      subject,
-      text,
-      html, // Added HTML support
-    };
+    if (error) {
+      console.error("Resend API Error:", error);
+      throw error;
+    }
 
-    const info = await transporter.sendMail(mailOptions);
-    console.log("Email sent: " + info.response);
-    return info;
+    console.log("Email sent successfully via Resend:", data);
+    return data;
   } catch (error) {
     console.error("Error sending email:", error);
     throw error;
