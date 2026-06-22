@@ -2,6 +2,9 @@ import { Resend } from 'resend';
 
 const sendEmail = async ({ to, subject, text, html }) => {
   try {
+    // Debug: log the first 10 chars of the key so we can verify Railway is injecting it
+    console.log("RESEND_API_KEY starts with:", process.env.RESEND_API_KEY ? process.env.RESEND_API_KEY.substring(0, 10) : "UNDEFINED");
+
     if (!process.env.RESEND_API_KEY) {
       throw new Error("Missing RESEND_API_KEY in environment variables");
     }
